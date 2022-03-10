@@ -26,7 +26,7 @@ class DataPreprocessor:
             transforms.ToTensor()
         ])
         # C:/Users/ovikd/Code/Python/PyTorch GAN/Images
-        self.train_loader = DataLoader(datasets.ImageFolder('images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
+        self.train_loader = DataLoader(datasets.ImageFolder('C:/Users/ovikd/Code/Python/PyTorch GAN/Images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
         self.cache = cache
         if self.cache:
             print('Caching all data...')
@@ -119,44 +119,43 @@ class Generator(nn.Module):
         return [block for block in self.conv_block_container]
     
     def add_conv_block(self):
-        if self.stage < self.max_stage:
-            self.conv_blocks = self.layers_to_list()[:-1]
-            out_channels = int(512/(2**(self.stage-1)))
+        self.conv_blocks = self.layers_to_list()[:-1]
+        out_channels = int(512/(2**(self.stage-1)))
 
-            self.conv_blocks.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(
-                        in_channels=int(1024/(2**(self.stage-1))),
-                        out_channels=out_channels,
-                        kernel_size=4,
-                        padding=1,
-                        stride=2,
-                        padding_mode='zeros',
-                        bias=False,
-                        device=device
-                    ),
-                    nn.BatchNorm2d(out_channels, device=device),
-                    nn.LeakyReLU(0.3)
+        self.conv_blocks.append(
+            nn.Sequential(
+                nn.ConvTranspose2d(
+                    in_channels=int(1024/(2**(self.stage-1))),
+                    out_channels=out_channels,
+                    kernel_size=4,
+                    padding=1,
+                    stride=2,
+                    padding_mode='zeros',
+                    bias=False,
+                    device=device
+                ),
+                nn.BatchNorm2d(out_channels, device=device),
+                nn.LeakyReLU(0.3)
+            )
+        )
+
+        self.conv_blocks.append(
+            nn.Sequential(
+                nn.ConvTranspose2d(
+                    in_channels=out_channels,
+                    out_channels=3,
+                    kernel_size=1,
+                    padding=0,
+                    stride=1,
+                    padding_mode='zeros',
+                    bias=False,
+                    device=device
                 )
             )
+        )        
 
-            self.conv_blocks.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(
-                        in_channels=out_channels,
-                        out_channels=3,
-                        kernel_size=1,
-                        padding=0,
-                        stride=1,
-                        padding_mode='zeros',
-                        bias=False,
-                        device=device
-                    )
-                )
-            )        
-
-            self.conv_block_container = nn.Sequential(*self.conv_blocks)
-            self.stage += 1
+        self.conv_block_container = nn.Sequential(*self.conv_blocks)
+        self.stage += 1
 
     def forward(self, x):
         '''
@@ -206,39 +205,38 @@ class Discriminator(nn.Module):
         return [block for block in self.conv_block_container]
     
     def add_conv_block(self):
-        if self.stage < self.max_stage:
-            self.conv_blocks = self.layers_to_list()[:-1]
-            in_channels = int(8*(2**(self.stage-1)))
-            dense_units = (2*in_channels)**3
+        self.conv_blocks = self.layers_to_list()[:-1]
+        in_channels = int(8*(2**(self.stage-1)))
+        dense_units = (2*in_channels)**3
 
-            self.conv_blocks.append(
-                nn.Sequential(
-                    nn.Conv2d(
-                        in_channels=in_channels,
-                        out_channels=in_channels*2,
-                        kernel_size=3,
-                        stride=1,
-                        padding='same',
-                        device=device
-                    ),
-                    nn.LeakyReLU(0.3),
-                    nn.Dropout(0.2)
+        self.conv_blocks.append(
+            nn.Sequential(
+                nn.Conv2d(
+                    in_channels=in_channels,
+                    out_channels=in_channels*2,
+                    kernel_size=3,
+                    stride=1,
+                    padding='same',
+                    device=device
+                ),
+                nn.LeakyReLU(0.3),
+                nn.Dropout(0.2)
+            )
+        )
+
+        self.conv_blocks.append(
+            nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(
+                    in_features=dense_units,
+                    out_features=1,
+                    device=device
                 )
             )
+        )   
 
-            self.conv_blocks.append(
-                nn.Sequential(
-                    nn.Flatten(),
-                    nn.Linear(
-                        in_features=dense_units,
-                        out_features=1,
-                        device=device
-                    )
-                )
-            )   
-
-            self.conv_block_container = nn.Sequential(*self.conv_blocks)
-            self.stage += 1
+        self.conv_block_container = nn.Sequential(*self.conv_blocks)
+        self.stage += 1
             
     def forward(self, x):
         x = self.conv_block_container(x)
@@ -376,12 +374,13 @@ def train(epochs):
             save_predictions(epoch+1, seed)
 
         # Adds a new conv block to both models after a variable # of epochs
-        if (epoch + 1) % 300 == 0:
-            preprocessor.increase_res(factor=2)
-            generator.add_conv_block()
-            discriminator.add_conv_block()
-            optimizers.refresh_params()
-            print(f'Switched to image size {preprocessor.image_size}')
+        if (epoch + 1) % 5 == 0:
+            if generator.stage < generator.max_stage + 1:
+                preprocessor.increase_res(factor=2)
+                generator.add_conv_block()
+                discriminator.add_conv_block()
+                optimizers.refresh_params()
+                print(f'Switched to image size {preprocessor.image_size}')
         
         # Save the model and optimizer states to a folder
         '''if (epoch + 1) % MODEL_SAVE_INTERVAL == 0:
