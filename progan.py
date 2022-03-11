@@ -13,7 +13,7 @@ print(f'Using {device}')
 
 # Constants
 BATCH_SIZE = 4
-UPSCALE_INTERVAL = 4
+UPSCALE_INTERVAL = 400
 EPOCHS = 10000
 SAVE_INTERVAL = 10
 MODEL_SAVE_INTERVAL = 10
@@ -27,7 +27,7 @@ class DataPreprocessor:
             transforms.ToTensor()
         ])
         # C:/Users/ovikd/Code/Python/PyTorch GAN/Images
-        self.train_loader = DataLoader(datasets.ImageFolder('C:/Users/ovikd/Code/Python/PyTorch GAN/Images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
+        self.train_loader = DataLoader(datasets.ImageFolder('images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
         self.cache = cache
         if self.cache:
             print('Caching all data...')
@@ -189,8 +189,7 @@ class Discriminator(nn.Module):
                     kernel_size=1,
                     stride=1
                 ),
-                nn.LeakyReLU(0.3),
-                nn.Dropout(0.2)
+                nn.LeakyReLU(0.3)
             ),
             nn.Sequential(
                 nn.Flatten(),
@@ -216,17 +215,11 @@ class Discriminator(nn.Module):
                     in_channels=self.in_channels,
                     out_channels=self.in_channels,
                     kernel_size=3,
-                    stride=1,
-                    padding='same',
+                    stride=2,
+                    padding=1,
                     device=device
                 ),
                 nn.LeakyReLU(0.3),
-                nn.Dropout(0.2),
-                nn.AvgPool2d(
-                    kernel_size=3,
-                    stride=2,
-                    padding=1
-                )
             )
         )
 
@@ -387,7 +380,6 @@ def train(epochs):
             if models.can_grow():
                 preprocessor.increase_res(factor=2)
                 models.add_conv_blocks()
-                models.restate_device(device)
                 optimizers.refresh_params()
                 print(f'Switched to image size {preprocessor.image_size}')
         
