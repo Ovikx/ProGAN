@@ -13,7 +13,8 @@ print(f'Using {device}')
 
 # Constants
 BATCH_SIZE = 4
-EPOCHS = 2000
+UPSCALE_INTERVAL = 4
+EPOCHS = 10000
 SAVE_INTERVAL = 10
 MODEL_SAVE_INTERVAL = 10
 BLOCK_ADD_INTERVAL = 20
@@ -171,19 +172,20 @@ class Discriminator(nn.Module):
     Predicts whether or not the input image is real. The discriminator's output range is (-inf, inf),
     but the loss function will map the output to (0, 1). 0 means fake and 1 means real.
     '''
-    def __init__(self, max_stage=8):
+    def __init__(self, max_stage=8, in_channels=64):
         '''
         Defines the layer structure. Pretty standard convolutional network
         '''
         super(Discriminator, self).__init__()
         self.stage = 1
         self.max_stage = max_stage
+        self.in_channels = in_channels
 
         self.conv_blocks = [
             nn.Sequential(
                 nn.Conv2d(
                     in_channels=3,
-                    out_channels=8,
+                    out_channels=self.in_channels,
                     kernel_size=1,
                     stride=1
                 ),
@@ -193,7 +195,7 @@ class Discriminator(nn.Module):
             nn.Sequential(
                 nn.Flatten(),
                 nn.Linear(
-                    in_features=512,
+                    in_features=8*8*self.in_channels,
                     out_features=1
                 )
             )
@@ -205,35 +207,28 @@ class Discriminator(nn.Module):
         return [block for block in self.conv_block_container]
     
     def add_conv_block(self):
-        self.conv_blocks = self.layers_to_list()[:-1]
-        in_channels = int(8*(2**(self.stage-1)))
-        dense_units = (2*in_channels)**3
+        self.conv_blocks = self.layers_to_list()
 
-        self.conv_blocks.append(
+        self.conv_blocks.insert(
+            1,
             nn.Sequential(
                 nn.Conv2d(
-                    in_channels=in_channels,
-                    out_channels=in_channels*2,
+                    in_channels=self.in_channels,
+                    out_channels=self.in_channels,
                     kernel_size=3,
                     stride=1,
                     padding='same',
                     device=device
                 ),
                 nn.LeakyReLU(0.3),
-                nn.Dropout(0.2)
-            )
-        )
-
-        self.conv_blocks.append(
-            nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(
-                    in_features=dense_units,
-                    out_features=1,
-                    device=device
+                nn.Dropout(0.2),
+                nn.AvgPool2d(
+                    kernel_size=3,
+                    stride=2,
+                    padding=1
                 )
             )
-        )   
+        )
 
         self.conv_block_container = nn.Sequential(*self.conv_blocks)
         self.stage += 1
@@ -242,6 +237,23 @@ class Discriminator(nn.Module):
         x = self.conv_block_container(x)
         return x
 
+class Models:
+    def __init__(self, max_stage, device):
+        self.max_stage = max_stage
+        self.generator = Generator(max_stage=max_stage).to(device)
+        self.discriminator = Discriminator(max_stage=max_stage).to(device)
+    
+    def restate_device(self, device):
+        self.generator = Generator(max_stage=self.max_stage).to(device)
+        self.discriminator = Discriminator(max_stage=self.max_stage).to(device)
+    
+    def add_conv_blocks(self):
+        self.generator.add_conv_block()
+        self.discriminator.add_conv_block()
+    
+    def can_grow(self):
+        return self.generator.stage < self.generator.max_stage + 1
+
 # Create the dataset
 preprocessor = DataPreprocessor(
     image_size=(8,8),
@@ -249,19 +261,16 @@ preprocessor = DataPreprocessor(
 )
 
 # Create the generator and discriminator objects
-generator = Generator(max_stage=5).to(device)
-discriminator = Discriminator(max_stage=5).to(device)
-'''seed = torch.randn((16, 100), device=device)
-print(discriminator(generator(seed)))
-import sys;sys.exit()'''
+models = Models(max_stage=5, device=device)
+
 # Define the loss function we are going to use for both the generator and the discriminator
 loss_function = nn.BCEWithLogitsLoss().to(device)
 
 # Define the models' respective optimizers
 class Optimizers:
     def __init__(self, GEN_LR=0.0002, DISC_LR=0.0002):
-        self.gen_opt = torch.optim.Adam(generator.parameters(), lr=GEN_LR)
-        self.disc_opt = torch.optim.Adam(discriminator.parameters(), lr=DISC_LR)
+        self.gen_opt = torch.optim.Adam(models.generator.parameters(), lr=GEN_LR)
+        self.disc_opt = torch.optim.Adam(models.discriminator.parameters(), lr=DISC_LR)
     
     def refresh_params(self):
         self.__init__()
@@ -271,8 +280,8 @@ optimizers = Optimizers()
 # Define the checkpoint manager that will help save/load models automatically (docs: https://pypi.org/project/pytorch-ckpt-manager/)
 manager = CheckpointManager(
     assets={
-        'gen' : generator.state_dict(),
-        'disc' : discriminator.state_dict(),
+        'gen' : models.generator.state_dict(),
+        'disc' : models.discriminator.state_dict(),
         'gen_opt' : optimizers.gen_opt.state_dict(),
         'disc_opt' : optimizers.disc_opt.state_dict()
     },
@@ -283,8 +292,8 @@ manager = CheckpointManager(
 
 # Load the states from the checkpoint directory if they exist
 load_data = manager.load()
-generator.load_state_dict(load_data['gen'])
-discriminator.load_state_dict(load_data['disc'])
+models.generator.load_state_dict(load_data['gen'])
+models.discriminator.load_state_dict(load_data['disc'])
 optimizers.gen_opt.load_state_dict(load_data['gen_opt'])
 optimizers.disc_opt.load_state_dict(load_data['disc_opt'])
 
@@ -301,7 +310,7 @@ def save_predictions(epoch, z):
     Saves a sample of generated images
     '''
     with torch.no_grad():
-        predictions = (generator(z).cpu().detach().numpy()*255).astype('int32')
+        predictions = (models.generator(z).cpu().detach().numpy()*255).astype('int32')
     fig = plt.figure(figsize=(12, 12))
 
     for i, image in enumerate(predictions):
@@ -331,20 +340,20 @@ def train(epochs):
             images, labels = data[0].to(device), torch.ones((BATCH_SIZE,1), device=device)
 
             # Zero the gradients
-            for param in generator.parameters():
+            for param in models.generator.parameters():
                 param.grad = None
-            for param in discriminator.parameters():
+            for param in models.discriminator.parameters():
                 param.grad = None
 
             # Get the generator's images
             noise = torch.randn((BATCH_SIZE, 100), device=device)
-            fake_images = generator(noise)
+            fake_images = models.generator(noise)
 
             # Backprop for the discriminator's guesses on the real images
             # Goal for the discriminator is to correctly guess that the real images are real
             # In theory, the loss function will compare the discriminator's predictions to 1.0 because 1.0 means real
             # We are using 0.9 because discriminator over-confidence can harm the generator's training
-            real_guess = discriminator(images)
+            real_guess = models.discriminator(images)
             disc_real_loss = loss_function(real_guess, torch.full_like(labels, 0.9, device=device))
             running_d_loss += disc_real_loss.to(torch.float16)
             disc_real_loss.backward()
@@ -352,7 +361,7 @@ def train(epochs):
             # Backprop for the discriminator's guesses on the fake images
             # 2nd goal for the discriminator is to correctly guess that the fake images are fake
             # The loss function will compare the discriminator's predictions to 0.0 because 0.0 means fake
-            fake_guess = discriminator(fake_images.detach())
+            fake_guess = models.discriminator(fake_images.detach())
             disc_fake_loss = loss_function(fake_guess, torch.zeros_like(fake_guess, device=device))
             running_d_loss += disc_fake_loss.to(torch.float16)
             disc_fake_loss.backward()
@@ -360,7 +369,7 @@ def train(epochs):
             # Generator loss
             # Goal for the generator is to fool the discriminator into thinking that its generated images are real
             # The loss function will compare the discriminator's predictions to 1.0 because the generator wants the discriminator to think its images are real
-            fake_guess = discriminator(fake_images)
+            fake_guess = models.discriminator(fake_images)
             gen_loss = loss_function(fake_guess, torch.ones_like(fake_guess, device=device))
             running_g_loss += gen_loss.to(torch.float16)
             gen_loss.backward()
@@ -374,11 +383,11 @@ def train(epochs):
             save_predictions(epoch+1, seed)
 
         # Adds a new conv block to both models after a variable # of epochs
-        if (epoch + 1) % 5 == 0:
-            if generator.stage < generator.max_stage + 1:
+        if (epoch + 1) % UPSCALE_INTERVAL == 0:
+            if models.can_grow():
                 preprocessor.increase_res(factor=2)
-                generator.add_conv_block()
-                discriminator.add_conv_block()
+                models.add_conv_blocks()
+                models.restate_device(device)
                 optimizers.refresh_params()
                 print(f'Switched to image size {preprocessor.image_size}')
         
