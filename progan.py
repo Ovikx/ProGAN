@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
 import numpy as np
@@ -12,8 +13,9 @@ device = torch.device(type='cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using {device}')
 
 # Constants
+ALPHA_INTERVAL = 1
 BATCH_SIZE = 4
-UPSCALE_INTERVAL = 400
+UPSCALE_INTERVAL = 100
 EPOCHS = 10000
 SAVE_INTERVAL = 10
 MODEL_SAVE_INTERVAL = 10
@@ -27,7 +29,7 @@ class DataPreprocessor:
             transforms.ToTensor()
         ])
         # C:/Users/ovikd/Code/Python/PyTorch GAN/Images
-        self.train_loader = DataLoader(datasets.ImageFolder('images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
+        self.train_loader = DataLoader(datasets.ImageFolder('C:/Users/ovikd/Code/Python/Pokemon GAN/images', transform=self.transform), batch_size=BATCH_SIZE, shuffle=True, drop_last=True, pin_memory=True)
         self.cache = cache
         if self.cache:
             print('Caching all data...')
@@ -54,7 +56,7 @@ class Generator(nn.Module):
     '''
     Takes in a 1D tensor (essentially a 1D array in this context) of random numbers and outputs an image represented by a 3D tensor
     '''
-    def __init__(self, max_stage=8):
+    def __init__(self, max_stage=8, alpha_rate=0.1):
         '''
         Defines the layer structure.
         Conv2dTranspose layers expand the image
@@ -62,17 +64,20 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
         self.stage = 1
         self.max_stage = max_stage
+        self.alpha = 1
+        self.alpha_rate = alpha_rate
         
         self.dense_stack = nn.Sequential(
             # Creates a massive 1D tensor for the following layers to reshape into a 3D tensor
             nn.Linear(
                 in_features=100,
                 out_features=8*8*2048,
-                bias=False
+                bias=False,
+                device=device
             ),
 
             # Batch normalization helps according to https://arxiv.org/pdf/1701.00160.pdf
-            nn.BatchNorm1d(8*8*2048),
+            nn.BatchNorm1d(8*8*2048, device=device),
             nn.LeakyReLU(0.3),
 
             # Turns that 1D tensor into a 3D tensor
@@ -95,13 +100,16 @@ class Generator(nn.Module):
                     stride=1,
                     padding=0,
                     padding_mode='zeros',
-                    bias=False
+                    bias=False,
+                    device=device
                 ),
-                nn.BatchNorm2d(1024),
+                nn.BatchNorm2d(1024, device=device),
                 nn.LeakyReLU(0.3)
                 # Output size: 1024, 8, 8
-            ),
-            nn.Sequential(
+            )
+        ]
+
+        self.to_rgb_new = nn.Sequential(
                 nn.ConvTranspose2d(
                     in_channels=1024,
                     out_channels=3,
@@ -109,19 +117,22 @@ class Generator(nn.Module):
                     padding=0,
                     stride=1,
                     padding_mode='zeros',
-                    bias=False
+                    bias=False,
+                    device=device
                 )
             )
-        ]
-
+        
         self.conv_block_container = nn.Sequential(*self.conv_blocks)
-
-    def layers_to_list(self):
-        return [block for block in self.conv_block_container]
     
+    def layers_to_list(self, seq):
+        return [layer for layer in seq]
+
     def add_conv_block(self):
-        self.conv_blocks = self.layers_to_list()[:-1]
+        self.to_rgb_old = self.to_rgb_new
+        self.alpha = 0
         out_channels = int(512/(2**(self.stage-1)))
+
+        self.conv_blocks = self.layers_to_list(self.conv_block_container)
 
         self.conv_blocks.append(
             nn.Sequential(
@@ -140,20 +151,18 @@ class Generator(nn.Module):
             )
         )
 
-        self.conv_blocks.append(
-            nn.Sequential(
-                nn.ConvTranspose2d(
-                    in_channels=out_channels,
-                    out_channels=3,
-                    kernel_size=1,
-                    padding=0,
-                    stride=1,
-                    padding_mode='zeros',
-                    bias=False,
-                    device=device
-                )
+        self.to_rgb_new = nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels=out_channels,
+                out_channels=3,
+                kernel_size=1,
+                padding=0,
+                stride=1,
+                padding_mode='zeros',
+                bias=False,
+                device=device
             )
-        )        
+        )
 
         self.conv_block_container = nn.Sequential(*self.conv_blocks)
         self.stage += 1
@@ -162,9 +171,20 @@ class Generator(nn.Module):
         '''
         Passes the input through the layer structure (aka forward propagation)
         '''
+        self.conv_blocks = self.layers_to_list(self.conv_block_container)
         x = self.dense_stack(x)
-        x = self.conv_block_container(x)
-        x = torch.sigmoid(x)
+        for layer in self.conv_blocks[:-1]:
+            x = layer(x)
+        
+        fading_x = self.conv_blocks[-1](x)
+        fading_x = self.to_rgb_new(fading_x)
+
+        if self.alpha < 1.0:
+            x2 = F.upsample_nearest(x, scale_factor=2)
+            x2 = self.to_rgb_old(x2)
+            fading_x = fading_x*self.alpha + x2*(1-self.alpha)
+
+        x = torch.sigmoid(fading_x)
         return x
 
 class Discriminator(nn.Module):
@@ -172,7 +192,7 @@ class Discriminator(nn.Module):
     Predicts whether or not the input image is real. The discriminator's output range is (-inf, inf),
     but the loss function will map the output to (0, 1). 0 means fake and 1 means real.
     '''
-    def __init__(self, max_stage=8, in_channels=64):
+    def __init__(self, max_stage=8, in_channels=64, alpha_rate=0.1):
         '''
         Defines the layer structure. Pretty standard convolutional network
         '''
@@ -180,36 +200,40 @@ class Discriminator(nn.Module):
         self.stage = 1
         self.max_stage = max_stage
         self.in_channels = in_channels
+        self.alpha = 1
+        self.alpha_rate = alpha_rate
+
+        self.from_rgb = nn.Sequential(
+            nn.Conv2d(
+                in_channels=3,
+                out_channels=self.in_channels,
+                kernel_size=1,
+                stride=1,
+                device=device
+            ),
+            nn.LeakyReLU(0.3)
+        )
 
         self.conv_blocks = [
-            nn.Sequential(
-                nn.Conv2d(
-                    in_channels=3,
-                    out_channels=self.in_channels,
-                    kernel_size=1,
-                    stride=1
-                ),
-                nn.LeakyReLU(0.3)
-            ),
             nn.Sequential(
                 nn.Flatten(),
                 nn.Linear(
                     in_features=8*8*self.in_channels,
-                    out_features=1
+                    out_features=1,
+                    device=device
                 )
             )
         ]
-
+    
         self.conv_block_container = nn.Sequential(*self.conv_blocks)
-    
-    def layers_to_list(self):
-        return [block for block in self.conv_block_container]
-    
-    def add_conv_block(self):
-        self.conv_blocks = self.layers_to_list()
+    def layers_to_list(self, seq):
+        return [layer for layer in seq]
 
+    def add_conv_block(self): 
+        self.conv_blocks = self.layers_to_list(self.conv_block_container)
+        self.alpha = 0
         self.conv_blocks.insert(
-            1,
+            0,
             nn.Sequential(
                 nn.Conv2d(
                     in_channels=self.in_channels,
@@ -219,7 +243,7 @@ class Discriminator(nn.Module):
                     padding=1,
                     device=device
                 ),
-                nn.LeakyReLU(0.3),
+                nn.LeakyReLU(0.3)
             )
         )
 
@@ -227,18 +251,29 @@ class Discriminator(nn.Module):
         self.stage += 1
             
     def forward(self, x):
-        x = self.conv_block_container(x)
-        return x
+        self.conv_blocks = self.layers_to_list(self.conv_block_container)
+        x = self.from_rgb(x)
+        fading_x = self.conv_blocks[0](x)
+        
+        if self.alpha < 1.0:
+            x2 = F.avg_pool2d(x, kernel_size=2)
+            fading_x = fading_x*self.alpha + x2*(1-self.alpha)
+        
+        for layer in self.conv_blocks[1:]:
+            fading_x = layer(fading_x)
+
+        return fading_x
 
 class Models:
-    def __init__(self, max_stage, device):
+    def __init__(self, max_stage, device, alpha_rate):
         self.max_stage = max_stage
-        self.generator = Generator(max_stage=max_stage).to(device)
-        self.discriminator = Discriminator(max_stage=max_stage).to(device)
+        self.alpha_rate = alpha_rate
+        self.generator = Generator(max_stage=max_stage, alpha_rate=alpha_rate).to(device)
+        self.discriminator = Discriminator(max_stage=max_stage, alpha_rate=alpha_rate).to(device)
     
     def restate_device(self, device):
-        self.generator = Generator(max_stage=self.max_stage).to(device)
-        self.discriminator = Discriminator(max_stage=self.max_stage).to(device)
+        self.generator = Generator(max_stage=self.max_stage, alpha_rate=self.alpha_rate).to(device)
+        self.discriminator = Discriminator(max_stage=self.max_stage, alpha_rate=self.alpha_rate).to(device)
     
     def add_conv_blocks(self):
         self.generator.add_conv_block()
@@ -254,7 +289,7 @@ preprocessor = DataPreprocessor(
 )
 
 # Create the generator and discriminator objects
-models = Models(max_stage=5, device=device)
+models = Models(max_stage=4, device=device, alpha_rate=0.01)
 
 # Define the loss function we are going to use for both the generator and the discriminator
 loss_function = nn.BCEWithLogitsLoss().to(device)
@@ -296,8 +331,19 @@ seed = torch.randn((16, 100), device=device)
 
 # Pray to NVIDIA that this line actually helps performance
 torch.backends.cudnn.benchmark = True
+'''def n_params():
+    cnt = 0
+    for param in models.generator.parameters():
+        for v in param:
+            cnt +=1 
+    return cnt
 
-
+print(n_params())
+for i in range(3):
+    models.generator.add_conv_block()
+    print(n_params())
+    print(models.generator)
+import sys;sys.exit()'''
 def save_predictions(epoch, z):
     '''
     Saves a sample of generated images
@@ -311,7 +357,7 @@ def save_predictions(epoch, z):
         plt.imshow(np.moveaxis(image, 0, -1), cmap=None)
         plt.axis('off')
     
-    plt.savefig(f'generated_images/gen_{epoch}')
+    plt.savefig(f'pokemon_generations/gen_{epoch}')
     plt.close()
 
 def train(epochs):
@@ -382,6 +428,10 @@ def train(epochs):
                 models.add_conv_blocks()
                 optimizers.refresh_params()
                 print(f'Switched to image size {preprocessor.image_size}')
+        
+        if (epoch + 1) % ALPHA_INTERVAL == 0 and models.can_grow():
+            models.generator.alpha += models.generator.alpha_rate
+            models.discriminator.alpha += models.discriminator.alpha_rate
         
         # Save the model and optimizer states to a folder
         '''if (epoch + 1) % MODEL_SAVE_INTERVAL == 0:
